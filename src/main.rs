@@ -13,8 +13,67 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use std::collections::HashMap;
+use image::io::Reader as ImageReader;
+use std::io::Cursor;
 
 const WORKER_URL: &str = "https://jam67.lu2000luk.workers.dev";
+
+#[derive(Clone, Debug)]
+pub struct ImageData {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct ImageCache {
+    cache: Arc<Mutex<HashMap<String, ImageData>>>,
+}
+
+impl ImageCache {
+    fn new() -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn load_image(&self, url: &str) -> std::result::Result<ImageData, Box<dyn std::error::Error + Send + Sync>> {
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(img) = cache.get(url) {
+                return Ok(img.clone());
+            }
+        }
+
+        let response = reqwest::Client::new().get(url).send().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let bytes = response.bytes().await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        let reader = ImageReader::new(Cursor::new(bytes));
+        let reader = reader.with_guessed_format()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        
+        let img = reader.decode()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+            .to_rgba8();
+        
+        let (width, height) = img.dimensions();
+        let data: Vec<u8> = img.into_raw();
+        
+        let image_data = ImageData { width, height, data };
+        
+        let mut cache = self.cache.lock().unwrap();
+        cache.insert(url.to_string(), image_data.clone());
+        
+        Ok(image_data)
+    }
+
+    fn get(&self, url: &str) -> Option<ImageData> {
+        self.cache.lock().unwrap().get(url).cloned()
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LobbyEvent {
@@ -42,6 +101,7 @@ struct LobbyManager {
     event_tx: broadcast::Sender<LobbyEvent>,
     is_host: bool,
     state: Arc<std::sync::Mutex<LobbyManagerState>>,
+    image_cache: ImageCache,
 }
 
 struct LobbyManagerState {
@@ -49,6 +109,7 @@ struct LobbyManagerState {
     connected_count: usize,
     current_sync: Option<LobbyEvent>,
     display_text: String,
+    current_image: Option<ImageData>,
 }
 
 impl LobbyManager {
@@ -59,11 +120,13 @@ impl LobbyManager {
             spotify,
             event_tx,
             is_host,
+            image_cache: ImageCache::new(),
             state: Arc::new(Mutex::new(LobbyManagerState {
                 connected_users: Vec::new(),
                 connected_count: 0,
                 current_sync: None,
                 display_text: String::from("Loading..."),
+                current_image: None,
             })),
         }
     }
@@ -90,6 +153,7 @@ impl LobbyManager {
             LobbyEvent::Sync {
                 ref paused,
                 ref name,
+                ref image_url,
                 ..
             } => {
                 let mut state = self.state.lock().unwrap();
@@ -101,6 +165,26 @@ impl LobbyManager {
                 } else {
                     name.clone()
                 };
+
+                drop(state);
+
+                // Load image asynchronously
+                if !image_url.is_empty() {
+                    let cache = self.image_cache.clone();
+                    let url = image_url.clone();
+                    let state = self.state.clone();
+                    tokio::spawn(async move {
+                        match cache.load_image(&url).await {
+                            Ok(img_data) => {
+                                let mut s = state.lock().unwrap();
+                                s.current_image = Some(img_data);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to load image: {}", e);
+                            }
+                        }
+                    });
+                }
 
                 if !self.is_host {
                     if let Err(e) = self.apply_sync(&event).await {
@@ -145,6 +229,28 @@ impl LobbyManager {
 
     fn get_display_text(&self) -> String {
         self.state.lock().unwrap().display_text.clone()
+    }
+
+    fn get_artist(&self) -> String {
+        let state = self.state.lock().unwrap();
+        if let Some(LobbyEvent::Sync { author, .. }) = &state.current_sync {
+            author.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    fn get_image_url(&self) -> String {
+        let state = self.state.lock().unwrap();
+        if let Some(LobbyEvent::Sync { image_url, .. }) = &state.current_sync {
+            image_url.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    fn get_image_data(&self) -> Option<ImageData> {
+        self.state.lock().unwrap().current_image.clone()
     }
 
     async fn listen_events_with_handler(
@@ -449,8 +555,10 @@ async fn main() -> Result<()> {
 
             AppState::InLobby { .. } => {
                 if let Some(ref manager) = lobby_manager {
-                    let connected_count = manager.get_connected_count();
+                    let _connected_count = manager.get_connected_count();
                     let display_text = manager.get_display_text();
+                    let artist = manager.get_artist();
+                    let image_data = manager.get_image_data();
 
                     let title = if is_host {
                         format!("Host / Jam67")
@@ -460,11 +568,55 @@ async fn main() -> Result<()> {
 
                     ui.window(&title)
                         .resizable(false)
-                        .size([560.0, 240.0], Condition::FirstUseEver)
+                        .size([560.0, 400.0], Condition::FirstUseEver)
                         .movable(true)
                         .collapsible(false)
                         .build(|| {
+                            // Display album art as a colored box placeholder
+                            let draw_list = ui.get_window_draw_list();
+                            let [x, y] = ui.cursor_screen_pos();
+                            
+                            if let Some(img_data) = image_data {
+                                // Draw a colored rectangle as placeholder
+                                // Calculate average color from image for visualization
+                                let sample_size = (img_data.data.len() / 4).min(100);
+                                let mut r_sum = 0u32;
+                                let mut g_sum = 0u32;
+                                let mut b_sum = 0u32;
+                                
+                                for i in 0..sample_size {
+                                    let idx = (i * 4) % img_data.data.len();
+                                    if idx + 2 < img_data.data.len() {
+                                        r_sum += img_data.data[idx] as u32;
+                                        g_sum += img_data.data[idx + 1] as u32;
+                                        b_sum += img_data.data[idx + 2] as u32;
+                                    }
+                                }
+                                
+                                let r = (r_sum / sample_size.max(1) as u32) as u8;
+                                let g = (g_sum / sample_size.max(1) as u32) as u8;
+                                let b = (b_sum / sample_size.max(1) as u32) as u8;
+                                
+                                draw_list
+                                    .add_rect([x, y], [x + 200.0, y + 200.0], imgui::ImColor32::from_rgb(r, g, b))
+                                    .filled(true)
+                                    .build();
+                                
+                                // Add text overlay with image info
+                                draw_list.add_text([x + 10.0, y + 90.0], imgui::ImColor32::WHITE, 
+                                    &format!("{}x{}", img_data.width, img_data.height));
+                                
+                                ui.dummy([200.0, 200.0]);
+                            } else {
+                                ui.text("Loading album art...");
+                                ui.dummy([200.0, 10.0]);
+                            }
+                            
+                            ui.spacing();
                             ui.text(&display_text);
+                            if !artist.is_empty() {
+                                ui.text(format!("Artist: {}", artist));
+                            }
                             ui.spacing();
 
                             if is_host {
