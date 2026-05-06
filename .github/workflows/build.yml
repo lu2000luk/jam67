@@ -9,16 +9,20 @@ env:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install cross
+        run: cargo install cross
+
       - name: Build
-        run: cargo build --release --verbose
+        run: cross build --release --verbose --target x86_64-pc-windows-gnu
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: jam67
-          path: target/release/
+          path: target/x86_64-pc-windows-gnu/release/
+

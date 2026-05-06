@@ -1,4 +1,4 @@
-// #![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 use arboard::Clipboard;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
@@ -15,7 +15,9 @@ use spoti::SpotifyController;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use rand::Rng;
+use rand::thread_rng;
+use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -721,10 +723,14 @@ async fn main() -> Result<()> {
     let mut lobby_manager: Option<Arc<LobbyManager>> = None;
 
     app.run(move |ui, _style| {
-        let should_show_ui = foreground_window_path()
-            .map(|path| path.to_lowercase().contains("spotify"))
-            .unwrap_or(false);
-        if !should_show_ui {
+        // Only hide when a different app (not Spotify, not this overlay, not desktop/nothing) is focused
+        let should_hide = foreground_window_path()
+            .map(|path| {
+                let lower = path.to_lowercase();
+                !lower.contains("spotify") && !lower.contains("jam67")
+            })
+            .unwrap_or(false); // None = no foreground window / desktop → show
+        if should_hide {
             return true;
         }
 
@@ -746,11 +752,11 @@ async fn main() -> Result<()> {
                         ui.same_line();
 
                         if ui.button("Crea lobby") {
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis();
-                            lobby_code = format!("{:x}", now);
+                            const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                            let mut rng = thread_rng();
+                            lobby_code = (0..6)
+                                .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+                                .collect();
                             is_host = true;
                             app_state = AppState::CreatingLobby;
                         }
