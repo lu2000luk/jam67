@@ -227,6 +227,8 @@ struct LobbyManagerState {
     current_image: Option<ImageData>,
     current_image_url: String,
     image_loading: bool,
+    last_set_track_id: String,
+    last_track_change: Option<Instant>,
 }
 
 impl LobbyManager {
@@ -254,6 +256,8 @@ impl LobbyManager {
                 current_image: None,
                 current_image_url: String::new(),
                 image_loading: false,
+                last_set_track_id: String::new(),
+                last_track_change: None,
             })),
             ws_sender: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -386,19 +390,61 @@ impl LobbyManager {
             ..
         } = event
         {
+            // Check if we recently changed tracks (cooldown)
+            let (recently_changed, already_requested) = {
+                let state = self.state.lock().unwrap();
+                let recently = state.last_track_change
+                    .map(|t| t.elapsed() < std::time::Duration::from_secs(3))
+                    .unwrap_or(false);
+                let requested = !state.last_set_track_id.is_empty() && state.last_set_track_id == *id;
+                (recently, requested)
+            };
+
+            // Check current track ID and switch if needed
+            let current = self.spotify.get_id().await.unwrap_or_default();
+            let track_matches = &current == id || id.is_empty();
+
+            if !track_matches && !already_requested && !recently_changed {
+                println!("[guest] track changed, switching to {}", id);
+                self.spotify.set_track(id).await?;
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.last_set_track_id = id.clone();
+                    state.last_track_change = Some(Instant::now());
+                }
+                // Don't seek/play yet, let the track load. Next sync will handle it.
+                return Ok(());
+            }
+
+            // If we recently changed tracks, skip seek but still handle play/pause
+            if recently_changed && !track_matches {
+                println!("[guest] waiting for track to load, skipping sync");
+                return Ok(());
+            }
+
+            // Clear the track change tracking once the track has loaded
+            if track_matches && already_requested {
+                let mut state = self.state.lock().unwrap();
+                state.last_set_track_id.clear();
+                state.last_track_change = None;
+            }
+
             // Start timer immediately on receiving sync
             let receive_time = Instant::now();
             const LATENCY_BONUS_MS: u64 = 5;
 
-            let current = self.spotify.get_id().await.unwrap_or_default();
-            if &current != id && !id.is_empty() {
-                println!("[guest] track changed, would need to switch to {}", id);
-            }
-
             if *paused {
-                self.spotify.set_pause().await?;
+                // Only pause if currently playing
+                let is_playing = self.spotify.get_is_playing().await.unwrap_or(false);
+                if is_playing {
+                    self.spotify.set_pause().await?;
+                }
             } else {
-                self.spotify.set_play().await?;
+                // Only resume if currently paused
+                let is_playing = self.spotify.get_is_playing().await.unwrap_or(true);
+                if !is_playing {
+                    self.spotify.set_play().await?;
+                }
 
                 // Get client's current playback position
                 let local_position = self.spotify.get_progress_ms().await.unwrap_or(0);
@@ -413,8 +459,8 @@ impl LobbyManager {
                     diff, timestamp_ms, local_position
                 );
 
-                // Only seek if the difference is greater than 1.5 seconds
-                if diff > 1500 {
+                // Only seek if the difference is greater than 2 seconds
+                if diff > 2000 {
                     // Adjust seek target by elapsed time since receive + latency bonus
                     let elapsed_ms = receive_time.elapsed().as_millis() as u64;
                     let adjusted_target = timestamp_ms + elapsed_ms + LATENCY_BONUS_MS;
@@ -424,7 +470,7 @@ impl LobbyManager {
                     );
                     self.spotify.set_seek(adjusted_target).await?;
                 } else {
-                    println!("[guest] diff {}ms <= 1500ms, skipping seek", diff);
+                    println!("[guest] diff {}ms <= 2000ms, skipping seek", diff);
                 }
             }
         }
@@ -602,8 +648,10 @@ impl LobbyManager {
                         info.title.clone()
                     };
 
+                    let track_id = self.spotify.get_id().await.unwrap_or_default();
+
                     let sync_event = LobbyEvent::Sync {
-                        id: String::new(),
+                        id: track_id,
                         name: info.title.clone(),
                         author: info.artist.clone(),
                         image_url: info.image_url.clone(),

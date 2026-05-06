@@ -605,6 +605,36 @@ impl SpotifyController {
         &self,
         position_ms: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let js = format!(
+            r###"
+            (() => {{
+                const pos = {};
+                if (!window.JAM67_PLAYERAPI) return false;
+
+                // Try the internal player API first (most stable)
+                if (typeof window.JAM67_PLAYERAPI.seekTo === 'function') {{
+                    window.JAM67_PLAYERAPI.seekTo(pos);
+                    return true;
+                }}
+
+                // Fallback: generic seek if exposed with a different name
+                if (typeof window.JAM67_PLAYERAPI.seek === 'function') {{
+                    window.JAM67_PLAYERAPI.seek(pos);
+                    return true;
+                }}
+
+                return false;
+            }})()
+            "###,
+            position_ms
+        );
+
+        let ok = self.eval_js(&js).await?.as_bool().unwrap_or(false);
+        if ok {
+            return Ok(());
+        }
+
+        // Last fallback: UI-based seek (kept as backup only)
         let duration_ms = self.get_duration_ms().await.unwrap_or(1);
         let pct = if duration_ms > 0 {
             (position_ms as f64 / duration_ms as f64) * 100.0
@@ -612,7 +642,7 @@ impl SpotifyController {
             0.0
         };
         let pct = pct.clamp(0.0, 100.0);
-        let js = format!(
+        let fallback_js = format!(
             r###"
             (() => {{
                 const p = {};
@@ -629,7 +659,7 @@ impl SpotifyController {
             "###,
             pct
         );
-        self.eval_js(&js).await?;
+        self.eval_js(&fallback_js).await?;
         Ok(())
     }
 
