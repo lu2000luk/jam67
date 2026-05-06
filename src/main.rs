@@ -195,7 +195,7 @@ impl LobbyManager {
     async fn host_polling_loop(
         self: &Arc<Self>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let polling_interval = std::time::Duration::from_millis(2500);
+        let polling_interval = std::time::Duration::from_millis(300);
 
         loop {
             tokio::time::sleep(polling_interval).await;
@@ -204,7 +204,11 @@ impl LobbyManager {
                 Ok(info) => {
                     println!(
                         "[host] {} - {} | {}ms / {}ms | playing={}",
-                        info.title, info.artist, info.progress_ms, info.duration_ms, info.is_playing
+                        info.title,
+                        info.artist,
+                        info.progress_ms,
+                        info.duration_ms,
+                        info.is_playing
                     );
 
                     let title_display = if info.title.is_empty() {
@@ -252,8 +256,58 @@ async fn main() -> Result<()> {
         }
         Err(e) => {
             eprintln!("CDP connect failed: {}", e);
-            eprintln!("Make sure Spotify is running with --remote-debugging-port=3132");
-            std::process::exit(1);
+            eprintln!("Trying to restart Spotify with --remote-debugging-port=3132...");
+            let kill_cmd = std::process::Command::new("powershell")
+                .args([
+                    "-Command",
+                    "Get-Process -Name Spotify -ErrorAction SilentlyContinue | Stop-Process -Force",
+                ])
+                .output();
+            if let Ok(o) = &kill_cmd {
+                if !o.status.success() {
+                    eprintln!("Failed to kill existing Spotify processes");
+                }
+            }
+            let spotify_path = {
+                let appdata = std::env::var("APPDATA").unwrap_or_default();
+                format!("{}\\Spotify\\Spotify.exe", appdata)
+            };
+            match std::process::Command::new(&spotify_path)
+                .arg("--remote-debugging-port=3132")
+                .spawn()
+            {
+                Ok(_) => {
+                    println!("Launched Spotify, retrying connection...");
+                    let mut connected = false;
+                    let mut spotify_arc: Option<Arc<SpotifyController>> = None;
+                    for delay in &[2, 4, 8] {
+                        println!("Waiting {}s...", delay);
+                        tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                        match SpotifyController::connect().await {
+                            Ok(s) => {
+                                println!("CDP connected OK after restart");
+                                spotify_arc = Some(Arc::new(s));
+                                connected = true;
+                                break;
+                            }
+                            Err(e2) => {
+                                eprintln!("Retry failed: {}", e2);
+                            }
+                        }
+                    }
+                    if connected {
+                        spotify_arc.unwrap()
+                    } else {
+                        eprintln!("CDP connect failed after all retries");
+                        eprintln!("Make sure Spotify is running with --remote-debugging-port=3132");
+                        std::process::exit(1);
+                    }
+                }
+                Err(e2) => {
+                    eprintln!("Failed to launch Spotify: {}", e2);
+                    std::process::exit(1);
+                }
+            }
         }
     };
 
@@ -358,8 +412,7 @@ async fn main() -> Result<()> {
                 if lobby_manager.is_none() {
                     let code = lobby_code.clone();
                     let s = spotify.clone();
-                    let mgr =
-                        Arc::new(LobbyManager::new(code.clone(), s, true));
+                    let mgr = Arc::new(LobbyManager::new(code.clone(), s, true));
 
                     {
                         {
@@ -400,14 +453,14 @@ async fn main() -> Result<()> {
                     let display_text = manager.get_display_text();
 
                     let title = if is_host {
-                        format!("Host - {} / Jam67", connected_count)
+                        format!("Host / Jam67")
                     } else {
                         "Guest / Jam67".to_string()
                     };
 
                     ui.window(&title)
                         .resizable(false)
-                        .size([400.0, 120.0], Condition::FirstUseEver)
+                        .size([560.0, 240.0], Condition::FirstUseEver)
                         .movable(true)
                         .collapsible(false)
                         .build(|| {

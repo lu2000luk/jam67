@@ -1,12 +1,20 @@
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex as TokioMutex;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const CDP_URL: &str = "http://127.0.0.1:3132";
 
 #[derive(Debug, Clone)]
 pub struct SpotifyController {
     client: reqwest::Client,
-    ws_endpoint: String,
+    ws_endpoint: Option<String>,
+    request_id: Arc<AtomicU64>,
+    tx: Arc<TokioMutex<Option<mpsc::UnboundedSender<(u64, String, serde_json::Value)>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,124 +28,114 @@ pub struct TrackInfo {
     pub is_playing: bool,
 }
 
-#[derive(Serialize)]
-struct CdpRequest {
-    id: u64,
-    method: String,
-    params: serde_json::Value,
-}
-
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 struct CdpResponse {
-    #[allow(dead_code)]
     id: Option<u64>,
     result: Option<serde_json::Value>,
-    #[allow(dead_code)]
-    error: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize, Debug)]
-struct JsonVersionResponse {
-    #[serde(rename = "webSocketDebuggerUrl")]
-    web_socket_debugger_url: String,
 }
 
 impl SpotifyController {
     pub async fn connect() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::new();
-        let json_url = format!("{}/json/version", CDP_URL);
-        let resp: JsonVersionResponse = client.get(&json_url).send().await?.json().await?;
-        Ok(Self {
+
+        // Get the WebSocket endpoint
+        let json_url = format!("{}/json", CDP_URL);
+        let pages: Vec<HashMap<String, serde_json::Value>> =
+            client.get(&json_url).send().await?.json().await?;
+
+        let mut ws_endpoint = None;
+        for page in pages {
+            let page_type = page.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let ws_url = page.get("webSocketDebuggerUrl").and_then(|v| v.as_str());
+
+            if page_type == "page" && ws_url.is_some() {
+                ws_endpoint = ws_url.map(|s| s.to_string());
+                break;
+            }
+        }
+
+        let ws_endpoint = ws_endpoint.ok_or("No Spotify renderer page found")?;
+
+        let instance = Self {
             client,
-            ws_endpoint: resp.web_socket_debugger_url,
-        })
+            ws_endpoint: Some(ws_endpoint),
+            request_id: Arc::new(AtomicU64::new(1)),
+            tx: Arc::new(TokioMutex::new(None)),
+        };
+
+        // Test connection
+        match instance.test_connection().await {
+            Ok(_) => {
+                println!("[jam67] Attached!");
+                Ok(instance)
+            }
+            Err(e) => {
+                eprintln!("Failed to execute test JS: {}", e);
+                Err("Failed to connect to Spotify".into())
+            }
+        }
+    }
+
+    async fn test_connection(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.eval_js("console.log('[jam67] Attached!'); true")
+            .await?;
+        Ok(())
     }
 
     async fn eval_js(
         &self,
         expression: &str,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let session_id = self.get_renderer_session().await?;
-        let result = self.runtime_evaluate(&session_id, expression).await?;
-        Ok(result)
-    }
+        let ws_url = self.ws_endpoint.as_ref().ok_or("No WebSocket endpoint")?;
 
-    async fn get_renderer_session(
-        &self,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let list_url = format!("{}/json", CDP_URL);
-        let pages: Vec<HashMap<String, serde_json::Value>> =
-            self.client.get(&list_url).send().await?.json().await?;
+        // Connect to WebSocket
+        let (ws_stream, _) = connect_async(ws_url).await?;
+        let (mut write, mut read) = ws_stream.split();
 
-        for page in &pages {
-            let page_type = page.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let url = page.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            let ws_url = page
-                .get("webSocketDebuggerUrl")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+        // Send the evaluate request
+        let id = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let request = serde_json::json!({
+            "id": id,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true
+            }
+        });
 
-            if page_type == "page" && !url.is_empty() && !ws_url.is_empty() {
-                return Ok(ws_url.to_string());
+        write
+            .send(Message::Text(request.to_string().into()))
+            .await?;
+
+        // Read response until we get our response
+        while let Some(msg) = read.next().await {
+            match msg? {
+                Message::Text(text) => {
+                    if let Ok(response) = serde_json::from_str::<CdpResponse>(&text) {
+                        if response.id == Some(id) {
+                            let result = response
+                                .result
+                                .and_then(|r| {
+                                    r.get("result").and_then(|rr| rr.get("value")).cloned()
+                                })
+                                .unwrap_or(serde_json::Value::Null);
+                            return Ok(result);
+                        }
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
             }
         }
 
-        Err("No Spotify renderer page found".into())
+        Err("No response from CDP".into())
     }
-
-    async fn cdp_call(
-        &self,
-        ws_url: &str,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let request = CdpRequest {
-            id: rand::random(),
-            method: method.to_string(),
-            params,
-        };
-
-        let response = self
-            .client
-            .post(ws_url)
-            .json(&request)
-            .send()
-            .await?
-            .json::<CdpResponse>()
-            .await?;
-
-        response
-            .result
-            .ok_or_else(|| "CDP call returned no result".into())
-    }
-
-    async fn runtime_evaluate(
-        &self,
-        ws_url: &str,
-        expression: &str,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let params = serde_json::json!({
-            "expression": expression,
-            "returnByValue": true,
-            "awaitPromise": true,
-        });
-
-        let result = self.cdp_call(ws_url, "Runtime.evaluate", params).await?;
-        Ok(result
-            .get("result")
-            .and_then(|v| v.get("value"))
-            .cloned()
-            .unwrap_or(serde_json::Value::Null))
-    }
-
-    // -------------------------------------------------------------------------
-    // Script slots - populate these with the JS your custom code needs
-    // -------------------------------------------------------------------------
 
     pub async fn get_title(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let js = r###"
             (() => {
-                const el = document.querySelectorAll('[data-testid="context-item-info-title"]')[0];
+                const el = document.querySelector(".main-nowPlayingWidget-trackInfo")?.children[0];
                 return el ? el.textContent : "";
             })()
         "###;
@@ -148,7 +146,7 @@ impl SpotifyController {
     pub async fn get_artist(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let js = r###"
             (() => {
-                const el = document.querySelectorAll('[data-testid="context-item-info-artist"]')[0];
+                const el = document.querySelector(".main-nowPlayingWidget-trackInfo")?.children[2];
                 return el ? el.textContent : "";
             })()
         "###;
@@ -157,22 +155,13 @@ impl SpotifyController {
     }
 
     pub async fn get_album(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let js = r###"
-            (() => {
-                // TODO: add album selector when needed
-                return "";
-            })()
-        "###;
-        let val = self.eval_js(js).await?;
-        Ok(val.as_str().unwrap_or("").to_string())
+        Ok(String::new())
     }
 
-    pub async fn get_image_url(
-        &self,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_image_url(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let js = r###"
             (() => {
-                const imgs = document.querySelectorAll('[data-testid="cover-art-image"]');
+                const imgs = document.querySelectorAll(".cover-art-image");
                 return imgs.length > 0 ? imgs[0].src : "";
             })()
         "###;
@@ -230,10 +219,6 @@ impl SpotifyController {
         let val = self.eval_js(js).await?;
         Ok(val.as_str().unwrap_or("").to_string())
     }
-
-    // -------------------------------------------------------------------------
-    // Setters / actions
-    // -------------------------------------------------------------------------
 
     async fn toggle_playpause(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let js = r###"
