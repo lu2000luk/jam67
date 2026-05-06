@@ -33,7 +33,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-const WS_SERVER_URL: &str = "ws://localhost:8080/";
+const WS_SERVER_URL: &str = "wss://67worker.lu2000luk.com/";
 
 unsafe fn create_d3d11_texture(
     device: &ID3D11Device,
