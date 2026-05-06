@@ -893,7 +893,7 @@ async fn main() -> Result<()> {
 
                     ui.window(&title)
                         .resizable(false)
-                        .size([560.0, 250.0], Condition::FirstUseEver)
+                        .size([360.0, 250.0], Condition::FirstUseEver)
                         .movable(true)
                         .collapsible(false)
                         .build(|| {
