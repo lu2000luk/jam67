@@ -15,7 +15,7 @@ use spoti::SpotifyController;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -33,10 +33,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-const WS_SERVER_URL: &str = "ws://localhost:8080";
+const WS_SERVER_URL: &str = "ws://localhost:8080/";
 
-/// Create a D3D11 texture from RGBA pixel data
-/// Returns the (SRV pointer as TextureId, Texture, SRV)
 unsafe fn create_d3d11_texture(
     device: &ID3D11Device,
     width: u32,
@@ -386,6 +384,10 @@ impl LobbyManager {
             ..
         } = event
         {
+            // Start timer immediately on receiving sync
+            let receive_time = Instant::now();
+            const LATENCY_BONUS_MS: u64 = 5;
+
             let current = self.spotify.get_id().await.unwrap_or_default();
             if &current != id && !id.is_empty() {
                 println!("[guest] track changed, would need to switch to {}", id);
@@ -395,7 +397,33 @@ impl LobbyManager {
                 self.spotify.set_pause().await?;
             } else {
                 self.spotify.set_play().await?;
-                self.spotify.set_seek(*timestamp_ms).await?;
+
+                // Get client's current playback position
+                let local_position = self.spotify.get_progress_ms().await.unwrap_or(0);
+                let diff = if *timestamp_ms > local_position {
+                    *timestamp_ms - local_position
+                } else {
+                    local_position - *timestamp_ms
+                };
+
+                println!(
+                    "[guest] sync diff: {}ms (host={}ms, local={}ms)",
+                    diff, timestamp_ms, local_position
+                );
+
+                // Only seek if the difference is greater than 1.5 seconds
+                if diff > 1500 {
+                    // Adjust seek target by elapsed time since receive + latency bonus
+                    let elapsed_ms = receive_time.elapsed().as_millis() as u64;
+                    let adjusted_target = timestamp_ms + elapsed_ms + LATENCY_BONUS_MS;
+                    println!(
+                        "[guest] seeking to {}ms (elapsed={}ms, bonus={}ms)",
+                        adjusted_target, elapsed_ms, LATENCY_BONUS_MS
+                    );
+                    self.spotify.set_seek(adjusted_target).await?;
+                } else {
+                    println!("[guest] diff {}ms <= 1500ms, skipping seek", diff);
+                }
             }
         }
         Ok(())
@@ -436,29 +464,29 @@ impl LobbyManager {
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut reconnect_attempts = 0;
         let max_reconnect_attempts = 10;
-        
+
         println!("[jam67] *** LOBBY ID: {} ***", self.lobby_id);
-        
+
         loop {
             let ws_url = format!("{}?id={}", WS_SERVER_URL, self.lobby_id);
             println!("[jam67] Connecting to WebSocket: {}", ws_url);
-            
+
             match connect_async(&ws_url).await {
                 Ok((ws_stream, _)) => {
                     reconnect_attempts = 0;
                     println!("[jam67] WebSocket connected successfully");
-                    
+
                     let (mut write, mut read) = ws_stream.split();
-                    
+
                     // Create channel for outgoing messages
                     let (tx, mut rx) = mpsc::channel::<Message>(32);
-                    
+
                     // Store sender in ws_sender for publish_event to use
                     {
                         let mut ws_sender = self.ws_sender.lock().await;
                         *ws_sender = Some(tx);
                     }
-                    
+
                     // Spawn task to handle outgoing messages
                     let write_task = tokio::spawn(async move {
                         while let Some(msg) = rx.recv().await {
@@ -468,7 +496,7 @@ impl LobbyManager {
                             }
                         }
                     });
-                    
+
                     // Handle incoming messages
                     let self_clone = self.clone();
                     let read_task = tokio::spawn(async move {
@@ -492,19 +520,19 @@ impl LobbyManager {
                             }
                         }
                     });
-                    
+
                     // Wait for either task to finish
                     tokio::select! {
                         _ = write_task => {},
                         _ = read_task => {},
                     }
-                    
+
                     // Clear the sender
                     {
                         let mut ws_sender = self.ws_sender.lock().await;
                         *ws_sender = None;
                     }
-                    
+
                     println!("[jam67] Connection lost, attempting to reconnect...");
                     reconnect_attempts += 1;
                     if reconnect_attempts >= max_reconnect_attempts {
@@ -530,7 +558,7 @@ impl LobbyManager {
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let body = serde_json::to_string(&event)?;
         println!("[jam67] >> SENDING: {}", body);
-        
+
         let ws_sender = self.ws_sender.lock().await;
         if let Some(ref tx) = *ws_sender {
             tx.send(Message::Text(body.into())).await?;
