@@ -15,6 +15,7 @@ pub struct SpotifyController {
     ws_endpoint: Option<String>,
     request_id: Arc<AtomicU64>,
     tx: Arc<TokioMutex<Option<mpsc::UnboundedSender<(u64, String, serde_json::Value)>>>>,
+    was_restarted: Arc<tokio::sync::Mutex<bool>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +33,7 @@ pub struct TrackInfo {
 struct CdpResponse {
     id: Option<u64>,
     result: Option<serde_json::Value>,
+    error: Option<serde_json::Value>,
 }
 
 impl SpotifyController {
@@ -61,6 +63,7 @@ impl SpotifyController {
             ws_endpoint: Some(ws_endpoint),
             request_id: Arc::new(AtomicU64::new(1)),
             tx: Arc::new(TokioMutex::new(None)),
+            was_restarted: Arc::new(tokio::sync::Mutex::new(false)),
         };
 
         // Test connection
@@ -80,6 +83,354 @@ impl SpotifyController {
         self.eval_js("console.log('[jam67] Attached!'); true")
             .await?;
         Ok(())
+    }
+
+    pub async fn mark_as_restarted(&self) {
+        let mut was_restarted = self.was_restarted.lock().await;
+        *was_restarted = true;
+    }
+
+    pub async fn init_player_api_with_retries(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let was_restarted = {
+            let wr = self.was_restarted.lock().await;
+            *wr
+        };
+
+        let initial_delay = if was_restarted {
+            println!("[jam67] Spotify was restarted, waiting 2 seconds before searching for player API...");
+            std::time::Duration::from_secs(2)
+        } else {
+            println!(
+                "[jam67] Spotify was already running, searching for player API immediately..."
+            );
+            std::time::Duration::from_secs(0)
+        };
+
+        tokio::time::sleep(initial_delay).await;
+
+        let max_retries = 5;
+        for attempt in 1..=max_retries {
+            println!(
+                "[jam67] Searching for player API (attempt {}/{})",
+                attempt, max_retries
+            );
+
+            match self.send_cdp_commands_sequence().await {
+                Ok(result) => {
+                    if result.as_bool().unwrap_or(false) {
+                        println!("[jam67] Player API initialization completed successfully");
+                        return Ok(());
+                    } else {
+                        println!("[jam67] Player API object not found yet");
+                        if attempt < max_retries {
+                            println!("[jam67] Retrying in 2 seconds...");
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[jam67] Error during player API search: {}", e);
+                    if attempt < max_retries {
+                        println!("[jam67] Retrying in 2 seconds...");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "[jam67] Failed to find player API after {} attempts",
+            max_retries
+        );
+        Err("Failed to find player API object after max retries".into())
+    }
+
+    async fn send_cdp_message(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let ws_url = self.ws_endpoint.as_ref().ok_or("No WebSocket endpoint")?;
+
+        // Connect to WebSocket
+        let (ws_stream, _) = connect_async(ws_url).await?;
+        let (mut write, mut read) = ws_stream.split();
+
+        // Send the CDP request
+        let id = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let request = serde_json::json!({
+            "id": id,
+            "method": method,
+            "params": params
+        });
+
+        println!("[jam67] Sending CDP request: {}: {}", method, request);
+
+        write
+            .send(Message::Text(request.to_string().into()))
+            .await?;
+
+        // Read response until we get our response (with timeout)
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(60); // 60s timeout for heavy operations like queryObjects
+
+        while let Some(msg) = read.next().await {
+            if start.elapsed() > timeout {
+                return Err("CDP request timed out".into());
+            }
+
+            match msg? {
+                Message::Text(text) => {
+                    if method.contains("queryObjects") {
+                        println!("[jam67] Raw CDP message for queryObjects: {}", text);
+                    }
+                    if let Ok(response) = serde_json::from_str::<CdpResponse>(&text) {
+                        if response.id == Some(id) {
+                            if method.contains("queryObjects") {
+                                println!("[jam67] Parsed CdpResponse - id: {:?}, result: {:?}, error: {:?}",
+                                    response.id, response.result.as_ref().map(|_| "..."), response.error);
+                            }
+                            if let Some(error) = response.error {
+                                println!("[jam67] CDP error for {}: {}", method, error);
+                                return Err(format!("CDP error: {}", error).into());
+                            }
+                            let result = response.result.unwrap_or(serde_json::Value::Null);
+                            println!("[jam67] CDP response for {}: {}", method, result);
+                            return Ok(result);
+                        }
+                    } else if method.contains("queryObjects") {
+                        println!("[jam67] Failed to parse as CdpResponse");
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+
+        Err("No response from CDP".into())
+    }
+
+    async fn send_cdp_commands_sequence(
+        &self,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let ws_url = self.ws_endpoint.as_ref().ok_or("No WebSocket endpoint")?;
+
+        // Keep a single WebSocket connection open for all commands
+        let (ws_stream, _) = connect_async(ws_url).await?;
+        let (mut write, mut read) = ws_stream.split();
+
+        // Step 1: Get Object.prototype
+        println!("[jam67] Step 1: Getting Object.prototype...");
+        let id1 = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let request1 = serde_json::json!({
+            "id": id1,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": "Object.prototype",
+                "returnByValue": false
+            }
+        });
+        println!("[jam67] Sending: {}", request1);
+        write
+            .send(Message::Text(request1.to_string().into()))
+            .await?;
+
+        let prototype_object_id = {
+            let mut found = None;
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(10);
+
+            while let Some(msg) = read.next().await {
+                if start.elapsed() > timeout {
+                    return Err("Timeout waiting for Runtime.evaluate response".into());
+                }
+
+                match msg? {
+                    Message::Text(text) => {
+                        println!("[jam67] Response: {}", text);
+                        if let Ok(response) = serde_json::from_str::<CdpResponse>(&text) {
+                            if response.id == Some(id1) {
+                                if let Some(error) = response.error {
+                                    return Err(format!("CDP error: {}", error).into());
+                                }
+                                let result = response
+                                    .result
+                                    .ok_or("No result in Runtime.evaluate response")?;
+                                let oid = result
+                                    .get("result")
+                                    .and_then(|r| r.get("objectId"))
+                                    .and_then(|id| id.as_str())
+                                    .ok_or("Failed to get Object.prototype objectId")?
+                                    .to_string();
+                                println!("[jam67] Prototype objectId: {}", oid);
+                                found = Some(oid);
+                                break;
+                            }
+                        }
+                    }
+                    Message::Close(_) => return Err("WebSocket closed".into()),
+                    _ => {}
+                }
+            }
+            found.ok_or("Failed to get prototype object ID")?
+        };
+
+        // Step 2: Query all objects on the heap (using the SAME connection!)
+        println!("[jam67] Step 2: Querying all objects on the heap (this may take a while)...");
+        let id2 = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let request2 = serde_json::json!({
+            "id": id2,
+            "method": "Runtime.queryObjects",
+            "params": {
+                "prototypeObjectId": prototype_object_id
+            }
+        });
+        println!("[jam67] Sending: {}", request2);
+        write
+            .send(Message::Text(request2.to_string().into()))
+            .await?;
+
+        let objects_array_id = {
+            let mut found = None;
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(60); // queryObjects can take a while
+
+            while let Some(msg) = read.next().await {
+                if start.elapsed() > timeout {
+                    return Err("Timeout waiting for Runtime.queryObjects response".into());
+                }
+
+                match msg? {
+                    Message::Text(text) => {
+                        println!("[jam67] QueryObjects response: {}", text);
+                        if let Ok(response) = serde_json::from_str::<CdpResponse>(&text) {
+                            if response.id == Some(id2) {
+                                if let Some(error) = response.error {
+                                    return Err(
+                                        format!("CDP error in queryObjects: {}", error).into()
+                                    );
+                                }
+                                let result = response
+                                    .result
+                                    .ok_or("No result in Runtime.queryObjects response")?;
+                                println!("[jam67] QueryObjects result: {}", result);
+                                let oid = result
+                                    .get("objects")
+                                    .and_then(|o| o.get("objectId"))
+                                    .and_then(|id| id.as_str())
+                                    .ok_or("Failed to extract objects objectId")?
+                                    .to_string();
+                                println!("[jam67] Objects array objectId: {}", oid);
+                                found = Some(oid);
+                                break;
+                            }
+                        }
+                    }
+                    Message::Close(_) => return Err("WebSocket closed".into()),
+                    _ => {}
+                }
+            }
+            found.ok_or("Failed to get objects array ID")?
+        };
+
+        // Step 3: Call function to find the player object
+        println!("[jam67] Step 3: Searching for player API object...");
+        let id3 = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let function_decl = r#"
+            function() {
+                const props = [
+                    '_contextPlayer', '_contextualShuffle', '_defaultFeatureVersion',
+                    '_events', '_isLikedSongsListPlatformEnabled', '_isSleepTimerEnabled',
+                    '_playlistPlayServiceClient', '_playlistResyncerAPI', '_queue', '_sleepTimerCore'
+                ];
+                const found = this.find(obj =>
+                    obj && props.every(p => Object.prototype.hasOwnProperty.call(obj, p))
+                );
+                if (found) {
+                    window.JAM67_PLAYERAPI = found;
+                    return true;
+                }
+                return false;
+            }
+        "#;
+
+        let request3 = serde_json::json!({
+            "id": id3,
+            "method": "Runtime.callFunctionOn",
+            "params": {
+                "objectId": objects_array_id,
+                "functionDeclaration": function_decl,
+                "returnByValue": true
+            }
+        });
+        println!("[jam67] Sending callFunctionOn...");
+        write
+            .send(Message::Text(request3.to_string().into()))
+            .await?;
+
+        {
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(30);
+
+            while let Some(msg) = read.next().await {
+                if start.elapsed() > timeout {
+                    return Err("Timeout waiting for Runtime.callFunctionOn response".into());
+                }
+
+                match msg? {
+                    Message::Text(text) => {
+                        println!("[jam67] CallFunctionOn response: {}", text);
+                        if let Ok(response) = serde_json::from_str::<CdpResponse>(&text) {
+                            if response.id == Some(id3) {
+                                if let Some(error) = response.error {
+                                    return Err(
+                                        format!("CDP error in callFunctionOn: {}", error).into()
+                                    );
+                                }
+                                let result = response
+                                    .result
+                                    .ok_or("No result in Runtime.callFunctionOn response")?;
+                                let success = result
+                                    .get("result")
+                                    .and_then(|r| r.get("value"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+
+                                if success {
+                                    println!("[jam67] Player API object found and stored in window.JAM67_PLAYERAPI");
+                                } else {
+                                    eprintln!("[jam67] Failed to find player API object with expected properties");
+                                }
+
+                                return Ok(serde_json::json!(success));
+                            }
+                        }
+                    }
+                    Message::Close(_) => return Err("WebSocket closed".into()),
+                    _ => {}
+                }
+            }
+        }
+
+        Err("Failed to complete CDP sequence".into())
+    }
+
+    async fn init_player_api(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        println!("[jam67] Starting player API initialization...");
+
+        match self.send_cdp_commands_sequence().await {
+            Ok(_) => {
+                println!("[jam67] Player API initialization completed");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[jam67] Error during player API initialization: {}", e);
+                eprintln!("[jam67] Continuing without player API...");
+                Ok(()) // Don't fail the connection
+            }
+        }
     }
 
     async fn eval_js(
@@ -231,18 +582,22 @@ impl SpotifyController {
     }
 
     pub async fn set_play(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let playing = self.get_is_playing().await.unwrap_or(true);
-        if !playing {
-            self.toggle_playpause().await?;
-        }
+        let js = r###"
+            (() => {
+                window.JAM67_PLAYERAPI.resume();
+            })()
+        "###;
+        self.eval_js(js).await?;
         Ok(())
     }
 
     pub async fn set_pause(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let playing = self.get_is_playing().await.unwrap_or(false);
-        if playing {
-            self.toggle_playpause().await?;
-        }
+        let js = r###"
+            (() => {
+                window.JAM67_PLAYERAPI.pause();
+            })()
+        "###;
+        self.eval_js(js).await?;
         Ok(())
     }
 
@@ -273,6 +628,22 @@ impl SpotifyController {
             }})()
             "###,
             pct
+        );
+        self.eval_js(&js).await?;
+        Ok(())
+    }
+
+    pub async fn set_track(
+        &self,
+        track_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let js = format!(
+            r###"
+            (() => {{
+                window.JAM67_PLAYERAPI.play({{ uri: "spotify:track:{}" }}, {{}}, {{}});
+            }})()
+            "###,
+            track_id
         );
         self.eval_js(&js).await?;
         Ok(())

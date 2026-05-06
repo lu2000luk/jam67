@@ -1,4 +1,6 @@
 // #![windows_subsystem = "windows"]
+use arboard::Clipboard;
+use futures_util::SinkExt;
 use futures_util::StreamExt;
 use imgui::Condition;
 use imgui_rs_overlay::{
@@ -7,23 +9,116 @@ use imgui_rs_overlay::{
 };
 mod spoti;
 
+use image::io::Reader as ImageReader;
 use serde::{Deserialize, Serialize};
 use spoti::SpotifyController;
+use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use std::collections::HashMap;
-use image::io::Reader as ImageReader;
-use std::io::Cursor;
+use windows::core::Interface;
+use windows::core::PWSTR;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_IMMUTABLE,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-const WORKER_URL: &str = "https://jam67.lu2000luk.workers.dev";
+const WS_SERVER_URL: &str = "ws://localhost:8080";
 
-#[derive(Clone, Debug)]
+/// Create a D3D11 texture from RGBA pixel data
+/// Returns the (SRV pointer as TextureId, Texture, SRV)
+unsafe fn create_d3d11_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+    rgba_data: &[u8],
+) -> Option<(usize, ID3D11Texture2D, ID3D11ShaderResourceView)> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_IMMUTABLE,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        CPUAccessFlags: Default::default(),
+        MiscFlags: Default::default(),
+    };
+
+    let subresource = D3D11_SUBRESOURCE_DATA {
+        pSysMem: rgba_data.as_ptr() as _,
+        SysMemPitch: width * 4,
+        SysMemSlicePitch: 0,
+    };
+
+    let mut texture: Option<ID3D11Texture2D> = None;
+    device
+        .CreateTexture2D(&desc, Some(&subresource), Some(&mut texture))
+        .ok()?;
+    let texture = texture?;
+
+    let mut srv: Option<ID3D11ShaderResourceView> = None;
+    device
+        .CreateShaderResourceView(&texture, None, Some(&mut srv))
+        .ok()?;
+    let srv = srv?;
+
+    let texture_id = srv.as_raw() as *const () as usize;
+    Some((texture_id, texture, srv))
+}
+
+fn foreground_window_path() -> Option<String> {
+    unsafe {
+        let hwnd: HWND = GetForegroundWindow();
+        if hwnd.0 == std::ptr::null_mut() {
+            return None;
+        }
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = vec![0u16; 1024];
+        let mut size = buf.len() as u32;
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        )
+        .ok()?;
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        Some(path)
+    }
+}
+
+#[derive(Clone)]
 pub struct ImageData {
     pub width: u32,
     pub height: u32,
     pub data: Vec<u8>,
+    pub texture_id: Option<usize>, // D3D11 SRV pointer as TextureId
+    #[allow(dead_code)]
+    pub texture: Option<ID3D11Texture2D>, // Keep texture alive
+    #[allow(dead_code)]
+    pub srv: Option<ID3D11ShaderResourceView>, // Keep SRV alive
 }
 
 #[derive(Clone)]
@@ -38,7 +133,10 @@ impl ImageCache {
         }
     }
 
-    async fn load_image(&self, url: &str) -> std::result::Result<ImageData, Box<dyn std::error::Error + Send + Sync>> {
+    async fn load_image(
+        &self,
+        url: &str,
+    ) -> std::result::Result<ImageData, Box<dyn std::error::Error + Send + Sync>> {
         {
             let cache = self.cache.lock().unwrap();
             if let Some(img) = cache.get(url) {
@@ -46,27 +144,41 @@ impl ImageCache {
             }
         }
 
-        let response = reqwest::Client::new().get(url).send().await
+        let response = reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        let bytes = response.bytes().await
+        let bytes = response
+            .bytes()
+            .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        
+
         let reader = ImageReader::new(Cursor::new(bytes));
-        let reader = reader.with_guessed_format()
+        let reader = reader
+            .with_guessed_format()
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-        
-        let img = reader.decode()
+
+        let img = reader
+            .decode()
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
             .to_rgba8();
-        
+
         let (width, height) = img.dimensions();
         let data: Vec<u8> = img.into_raw();
-        
-        let image_data = ImageData { width, height, data };
-        
+
+        let image_data = ImageData {
+            width,
+            height,
+            data,
+            texture_id: None,
+            texture: None,
+            srv: None,
+        };
+
         let mut cache = self.cache.lock().unwrap();
         cache.insert(url.to_string(), image_data.clone());
-        
+
         Ok(image_data)
     }
 
@@ -102,6 +214,9 @@ struct LobbyManager {
     is_host: bool,
     state: Arc<std::sync::Mutex<LobbyManagerState>>,
     image_cache: ImageCache,
+    device: Option<ID3D11Device>,
+    device_context: Option<ID3D11DeviceContext>,
+    ws_sender: Arc<tokio::sync::Mutex<Option<mpsc::Sender<Message>>>>,
 }
 
 struct LobbyManagerState {
@@ -110,10 +225,18 @@ struct LobbyManagerState {
     current_sync: Option<LobbyEvent>,
     display_text: String,
     current_image: Option<ImageData>,
+    current_image_url: String,
+    image_loading: bool,
 }
 
 impl LobbyManager {
-    fn new(lobby_id: String, spotify: Arc<SpotifyController>, is_host: bool) -> Self {
+    fn new(
+        lobby_id: String,
+        spotify: Arc<SpotifyController>,
+        is_host: bool,
+        device: Option<ID3D11Device>,
+        device_context: Option<ID3D11DeviceContext>,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(32);
         Self {
             lobby_id,
@@ -121,14 +244,80 @@ impl LobbyManager {
             event_tx,
             is_host,
             image_cache: ImageCache::new(),
+            device,
+            device_context,
             state: Arc::new(Mutex::new(LobbyManagerState {
                 connected_users: Vec::new(),
                 connected_count: 0,
                 current_sync: None,
                 display_text: String::from("Loading..."),
                 current_image: None,
+                current_image_url: String::new(),
+                image_loading: false,
             })),
+            ws_sender: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    fn queue_image_load(&self, image_url: &str) {
+        if image_url.is_empty() {
+            let mut state = self.state.lock().unwrap();
+            state.current_image = None;
+            state.current_image_url.clear();
+            state.image_loading = false;
+            return;
+        }
+
+        let mut state = self.state.lock().unwrap();
+        let should_load = state.current_image_url != image_url
+            || (!state.image_loading && state.current_image.is_none());
+        if !should_load {
+            return;
+        }
+
+        state.current_image_url = image_url.to_string();
+        state.current_image = None;
+        state.image_loading = true;
+        drop(state);
+
+        let cache = self.image_cache.clone();
+        let url = image_url.to_string();
+        let state = self.state.clone();
+        let device = self.device.clone();
+        tokio::spawn(async move {
+            match cache.load_image(&url).await {
+                Ok(mut img_data) => {
+                    // Create D3D11 texture if device is available
+                    if let Some(ref dev) = device {
+                        if let Some((texture_id, texture, srv)) = unsafe {
+                            create_d3d11_texture(
+                                dev,
+                                img_data.width,
+                                img_data.height,
+                                &img_data.data,
+                            )
+                        } {
+                            img_data.texture_id = Some(texture_id);
+                            img_data.texture = Some(texture);
+                            img_data.srv = Some(srv);
+                        }
+                    }
+
+                    let mut s = state.lock().unwrap();
+                    if s.current_image_url == url {
+                        s.current_image = Some(img_data);
+                    }
+                    s.image_loading = false;
+                }
+                Err(e) => {
+                    eprintln!("Failed to load image: {}", e);
+                    let mut s = state.lock().unwrap();
+                    if s.current_image_url == url {
+                        s.image_loading = false;
+                    }
+                }
+            }
+        });
     }
 
     async fn handle_event(&self, event: LobbyEvent) {
@@ -149,6 +338,11 @@ impl LobbyManager {
                 let mut state = self.state.lock().unwrap();
                 state.connected_users.clear();
                 state.connected_count = 0;
+                state.current_sync = None;
+                state.display_text = String::from("Loading...");
+                state.current_image = None;
+                state.current_image_url.clear();
+                state.image_loading = false;
             }
             LobbyEvent::Sync {
                 ref paused,
@@ -156,35 +350,19 @@ impl LobbyManager {
                 ref image_url,
                 ..
             } => {
-                let mut state = self.state.lock().unwrap();
-                state.current_sync = Some(event.clone());
-                state.display_text = if name.is_empty() {
-                    "Loading...".to_string()
-                } else if *paused {
-                    "Paused".to_string()
-                } else {
-                    name.clone()
-                };
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.current_sync = Some(event.clone());
+                    state.display_text = if name.is_empty() {
+                        "Loading...".to_string()
+                    } else if *paused {
+                        "Paused".to_string()
+                    } else {
+                        name.clone()
+                    };
+                } // state is dropped here
 
-                drop(state);
-
-                // Load image asynchronously
-                if !image_url.is_empty() {
-                    let cache = self.image_cache.clone();
-                    let url = image_url.clone();
-                    let state = self.state.clone();
-                    tokio::spawn(async move {
-                        match cache.load_image(&url).await {
-                            Ok(img_data) => {
-                                let mut s = state.lock().unwrap();
-                                s.current_image = Some(img_data);
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to load image: {}", e);
-                            }
-                        }
-                    });
-                }
+                self.queue_image_load(image_url);
 
                 if !self.is_host {
                     if let Err(e) = self.apply_sync(&event).await {
@@ -256,40 +434,109 @@ impl LobbyManager {
     async fn listen_events_with_handler(
         self: &Arc<Self>,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{}/socket?id={}", WORKER_URL, self.lobby_id);
-        let ws_url = url
-            .replace("https://", "wss://")
-            .replace("http://", "ws://");
-
-        let (ws_stream, _) = connect_async(&ws_url).await?;
-        let (_write, mut read) = ws_stream.split();
-
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Ok(event) = serde_json::from_str::<LobbyEvent>(&text) {
-                        self.handle_event(event).await;
+        let mut reconnect_attempts = 0;
+        let max_reconnect_attempts = 10;
+        
+        println!("[jam67] *** LOBBY ID: {} ***", self.lobby_id);
+        
+        loop {
+            let ws_url = format!("{}?id={}", WS_SERVER_URL, self.lobby_id);
+            println!("[jam67] Connecting to WebSocket: {}", ws_url);
+            
+            match connect_async(&ws_url).await {
+                Ok((ws_stream, _)) => {
+                    reconnect_attempts = 0;
+                    println!("[jam67] WebSocket connected successfully");
+                    
+                    let (mut write, mut read) = ws_stream.split();
+                    
+                    // Create channel for outgoing messages
+                    let (tx, mut rx) = mpsc::channel::<Message>(32);
+                    
+                    // Store sender in ws_sender for publish_event to use
+                    {
+                        let mut ws_sender = self.ws_sender.lock().await;
+                        *ws_sender = Some(tx);
                     }
+                    
+                    // Spawn task to handle outgoing messages
+                    let write_task = tokio::spawn(async move {
+                        while let Some(msg) = rx.recv().await {
+                            if let Err(e) = write.send(msg).await {
+                                eprintln!("[jam67] Failed to send message: {}", e);
+                                break;
+                            }
+                        }
+                    });
+                    
+                    // Handle incoming messages
+                    let self_clone = self.clone();
+                    let read_task = tokio::spawn(async move {
+                        while let Some(msg) = read.next().await {
+                            match msg {
+                                Ok(Message::Text(text)) => {
+                                    println!("[jam67] << RECEIVED: {}", text);
+                                    if let Ok(event) = serde_json::from_str::<LobbyEvent>(&text) {
+                                        self_clone.handle_event(event).await;
+                                    }
+                                }
+                                Ok(Message::Close(_)) => {
+                                    eprintln!("[jam67] WebSocket closed by server");
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("[jam67] WebSocket error: {}", e);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                    
+                    // Wait for either task to finish
+                    tokio::select! {
+                        _ = write_task => {},
+                        _ = read_task => {},
+                    }
+                    
+                    // Clear the sender
+                    {
+                        let mut ws_sender = self.ws_sender.lock().await;
+                        *ws_sender = None;
+                    }
+                    
+                    println!("[jam67] Connection lost, attempting to reconnect...");
+                    reconnect_attempts += 1;
+                    if reconnect_attempts >= max_reconnect_attempts {
+                        return Err("Max reconnect attempts reached".into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
-                Ok(Message::Close(_)) => break,
                 Err(e) => {
-                    eprintln!("WebSocket error: {}", e);
-                    break;
+                    eprintln!("[jam67] Failed to connect WebSocket: {}", e);
+                    reconnect_attempts += 1;
+                    if reconnect_attempts >= max_reconnect_attempts {
+                        return Err(format!("Max reconnect attempts reached: {}", e).into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
-                _ => {}
             }
         }
-        Ok(())
     }
 
     async fn publish_event(
         &self,
         event: LobbyEvent,
     ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let client = reqwest::Client::new();
-        let url = format!("{}/push?id={}", WORKER_URL, self.lobby_id);
         let body = serde_json::to_string(&event)?;
-        client.post(&url).body(body).send().await?;
+        println!("[jam67] >> SENDING: {}", body);
+        
+        let ws_sender = self.ws_sender.lock().await;
+        if let Some(ref tx) = *ws_sender {
+            tx.send(Message::Text(body.into())).await?;
+        } else {
+            eprintln!("[jam67] WebSocket not connected, cannot send event");
+        }
         Ok(())
     }
 
@@ -327,9 +574,9 @@ impl LobbyManager {
 
                     let sync_event = LobbyEvent::Sync {
                         id: String::new(),
-                        name: info.title,
-                        author: info.artist,
-                        image_url: info.image_url,
+                        name: info.title.clone(),
+                        author: info.artist.clone(),
+                        image_url: info.image_url.clone(),
                         timestamp_ms: info.progress_ms,
                         duration_ms: info.duration_ms,
                         paused: !info.is_playing,
@@ -339,6 +586,8 @@ impl LobbyManager {
                     state.current_sync = Some(sync_event.clone());
                     state.display_text = title_display;
                     drop(state);
+
+                    self.queue_image_load(&info.image_url);
 
                     if let Err(e) = self.publish_event(sync_event).await {
                         eprintln!("[host] publish error: {}", e);
@@ -392,6 +641,7 @@ async fn main() -> Result<()> {
                         match SpotifyController::connect().await {
                             Ok(s) => {
                                 println!("CDP connected OK after restart");
+                                s.mark_as_restarted().await;
                                 spotify_arc = Some(Arc::new(s));
                                 connected = true;
                                 break;
@@ -417,13 +667,39 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Initialize player API with retries
+    match spotify.init_player_api_with_retries().await {
+        Ok(()) => {
+            println!("[jam67] Player API initialized successfully");
+        }
+        Err(e) => {
+            eprintln!("[jam67] Failed to initialize player API: {}", e);
+            eprintln!("[jam67] Exiting...");
+            std::process::exit(1);
+        }
+    }
+
     let mut app = Windows::new(&WindowsOptions::default())?;
+
+    // Get D3D11 device for texture creation
+    let (d3d_device, d3d_context) = match app.get_d3d11_devices() {
+        Some((device, context)) => (Some(device), Some(context)),
+        None => (None, None),
+    };
+
     let mut app_state = AppState::LobbyChoice;
     let mut lobby_code = String::new();
     let mut is_host = false;
     let mut lobby_manager: Option<Arc<LobbyManager>> = None;
 
     app.run(move |ui, _style| {
+        let should_show_ui = foreground_window_path()
+            .map(|path| path.to_lowercase().contains("spotify"))
+            .unwrap_or(false);
+        if !should_show_ui {
+            return true;
+        }
+
         match &app_state {
             AppState::LobbyChoice => {
                 ui.window("Jam67")
@@ -468,10 +744,19 @@ async fn main() -> Result<()> {
                     .build(|| {
                         ui.text("Codice lobby");
                         ui.input_text(" ", &mut lobby_code).build();
-                        ui.spacing();
 
                         if ui.button("Esci") {
                             std::process::exit(0);
+                        }
+
+                        ui.same_line();
+
+                        if ui.button("Incolla") {
+                            if let Ok(mut clipboard) = Clipboard::new() {
+                                if let Ok(text) = clipboard.get_text() {
+                                    lobby_code = text;
+                                }
+                            }
                         }
 
                         ui.same_line();
@@ -480,7 +765,13 @@ async fn main() -> Result<()> {
                             let code = lobby_code.clone();
                             let s = spotify.clone();
 
-                            lobby_manager = Some(Arc::new(LobbyManager::new(code, s, false)));
+                            lobby_manager = Some(Arc::new(LobbyManager::new(
+                                code,
+                                s,
+                                false,
+                                d3d_device.clone(),
+                                d3d_context.clone(),
+                            )));
 
                             if let Some(ref manager) = lobby_manager {
                                 let mgr = manager.clone();
@@ -518,7 +809,13 @@ async fn main() -> Result<()> {
                 if lobby_manager.is_none() {
                     let code = lobby_code.clone();
                     let s = spotify.clone();
-                    let mgr = Arc::new(LobbyManager::new(code.clone(), s, true));
+                    let mgr = Arc::new(LobbyManager::new(
+                        code.clone(),
+                        s,
+                        true,
+                        d3d_device.clone(),
+                        d3d_context.clone(),
+                    ));
 
                     {
                         {
@@ -568,50 +865,26 @@ async fn main() -> Result<()> {
 
                     ui.window(&title)
                         .resizable(false)
-                        .size([560.0, 400.0], Condition::FirstUseEver)
+                        .size([560.0, 250.0], Condition::FirstUseEver)
                         .movable(true)
                         .collapsible(false)
                         .build(|| {
-                            // Display album art as a colored box placeholder
-                            let draw_list = ui.get_window_draw_list();
-                            let [x, y] = ui.cursor_screen_pos();
-                            
                             if let Some(img_data) = image_data {
-                                // Draw a colored rectangle as placeholder
-                                // Calculate average color from image for visualization
-                                let sample_size = (img_data.data.len() / 4).min(100);
-                                let mut r_sum = 0u32;
-                                let mut g_sum = 0u32;
-                                let mut b_sum = 0u32;
-                                
-                                for i in 0..sample_size {
-                                    let idx = (i * 4) % img_data.data.len();
-                                    if idx + 2 < img_data.data.len() {
-                                        r_sum += img_data.data[idx] as u32;
-                                        g_sum += img_data.data[idx + 1] as u32;
-                                        b_sum += img_data.data[idx + 2] as u32;
-                                    }
+                                // Render the actual album art image
+                                if let Some(texture_id) = img_data.texture_id {
+                                    let texture_id = imgui::TextureId::from(texture_id);
+                                    // Display image at 150x150 pixels
+                                    imgui::Image::new(texture_id, [120.0, 120.0]).build(ui);
+                                } else {
+                                    // Fallback if texture creation failed
+                                    ui.text("Loading album art...");
+                                    ui.dummy([150.0, 10.0]);
                                 }
-                                
-                                let r = (r_sum / sample_size.max(1) as u32) as u8;
-                                let g = (g_sum / sample_size.max(1) as u32) as u8;
-                                let b = (b_sum / sample_size.max(1) as u32) as u8;
-                                
-                                draw_list
-                                    .add_rect([x, y], [x + 200.0, y + 200.0], imgui::ImColor32::from_rgb(r, g, b))
-                                    .filled(true)
-                                    .build();
-                                
-                                // Add text overlay with image info
-                                draw_list.add_text([x + 10.0, y + 90.0], imgui::ImColor32::WHITE, 
-                                    &format!("{}x{}", img_data.width, img_data.height));
-                                
-                                ui.dummy([200.0, 200.0]);
                             } else {
                                 ui.text("Loading album art...");
-                                ui.dummy([200.0, 10.0]);
+                                ui.dummy([150.0, 10.0]);
                             }
-                            
+
                             ui.spacing();
                             ui.text(&display_text);
                             if !artist.is_empty() {
@@ -627,6 +900,14 @@ async fn main() -> Result<()> {
 
                             if ui.button("Esci") {
                                 std::process::exit(0);
+                            }
+
+                            ui.same_line();
+
+                            if ui.button("Copia Codice") {
+                                if let Ok(mut clipboard) = Clipboard::new() {
+                                    let _ = clipboard.set_text(lobby_code.clone());
+                                }
                             }
                         });
                 }
