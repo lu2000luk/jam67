@@ -955,6 +955,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jam67"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "bytes",
+ "futures-util",
+ "image 0.24.9",
+ "imgui",
+ "imgui-rs-overlay",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "urlencoding",
+ "windows",
+]
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1912,26 +1932,6 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "spoti-together"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "bytes",
- "futures-util",
- "image 0.24.9",
- "imgui",
- "imgui-rs-overlay",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "urlencoding",
- "windows",
 ]
 
 [[package]]
