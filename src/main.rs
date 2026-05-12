@@ -759,11 +759,9 @@ async fn main() -> Result<()> {
 
     let mut app = Windows::new(&WindowsOptions::default())?;
 
-    // Get D3D11 device for texture creation
-    let (d3d_device, d3d_context) = match app.get_d3d11_devices() {
-        Some((device, context)) => (Some(device), Some(context)),
-        None => (None, None),
-    };
+    // imgui-rs-overlay no longer exposes D3D11 device/context accessors
+    let (d3d_device, d3d_context): (Option<ID3D11Device>, Option<ID3D11DeviceContext>) =
+        (None, None);
 
     let mut app_state = AppState::LobbyChoice;
     let mut lobby_code = String::new();
