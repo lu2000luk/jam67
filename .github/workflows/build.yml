@@ -21,7 +21,7 @@ jobs:
 
       - name: Install cross
         run: |
-          cargo install cross --no-confirm --locked
+          cargo install cross --locked
 
       - name: Build
         run: cross build --release --verbose --target x86_64-pc-windows-gnu
