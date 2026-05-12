@@ -1,4 +1,4 @@
-name: Rust Build and Artifact
+name: Build Release
 
 on:
   push:
@@ -16,8 +16,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
       - name: Install cross
-        run: cargo install cross
+        run: |
+          cargo install cargo-binstall --locked
+          cargo binstall cross --no-confirm --locked
 
       - name: Build
         run: cross build --release --verbose --target x86_64-pc-windows-gnu
@@ -26,4 +31,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: jam67
-          path: target/x86_64-pc-windows-gnu/release/
+          path: target/x86_64-pc-windows-gnu/release/jam67.exe
