@@ -584,7 +584,7 @@ impl SpotifyController {
     pub async fn set_play(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let js = r###"
             (() => {
-                window.JAM67_PLAYERAPI.resume();
+                try { window.JAM67_PLAYERAPI.resume(); } catch { Spicetify.Player.play(); }
             })()
         "###;
         self.eval_js(js).await?;
@@ -594,7 +594,7 @@ impl SpotifyController {
     pub async fn set_pause(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let js = r###"
             (() => {
-                window.JAM67_PLAYERAPI.pause();
+                try { window.JAM67_PLAYERAPI.pause(); } catch { Spicetify.Player.pause(); }
             })()
         "###;
         self.eval_js(js).await?;
@@ -670,10 +670,11 @@ impl SpotifyController {
         let js = format!(
             r###"
             (() => {{
-                window.JAM67_PLAYERAPI.play({{ uri: "spotify:track:{}" }}, {{}}, {{}});
+               // window.JAM67_PLAYERAPI.play({{ uri: "spotify:track:{}" }}, {{}}, {{}});
+               Spicetify.Player.playUri("spotify:track:{}");
             }})()
             "###,
-            track_id
+            track_id, track_id
         );
         self.eval_js(&js).await?;
         Ok(())

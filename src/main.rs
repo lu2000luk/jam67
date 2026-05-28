@@ -10,13 +10,13 @@ use imgui_rs_overlay::{
 mod spoti;
 
 use image::io::Reader as ImageReader;
+use rand::thread_rng;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use spoti::SpotifyController;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
-use rand::Rng;
-use rand::thread_rng;
 use std::time::Instant;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -35,7 +35,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-const WS_SERVER_URL: &str = "wss://67worker.lu2000luk.com/";
+const WS_SERVER_URL: &str = "wss://67worker.lu2000luk.com/"; // wss://jam67-production.up.railway.app/ OR wss://67worker.lu2000luk.com/
 
 unsafe fn create_d3d11_texture(
     device: &ID3D11Device,
@@ -393,10 +393,12 @@ impl LobbyManager {
             // Check if we recently changed tracks (cooldown)
             let (recently_changed, already_requested) = {
                 let state = self.state.lock().unwrap();
-                let recently = state.last_track_change
+                let recently = state
+                    .last_track_change
                     .map(|t| t.elapsed() < std::time::Duration::from_secs(3))
                     .unwrap_or(false);
-                let requested = !state.last_set_track_id.is_empty() && state.last_set_track_id == *id;
+                let requested =
+                    !state.last_set_track_id.is_empty() && state.last_set_track_id == *id;
                 (recently, requested)
             };
 
@@ -791,6 +793,7 @@ async fn main() -> Result<()> {
                     .collapsible(false)
                     .build(|| {
                         ui.text("Crea o entra in una lobby");
+                        ui.text("RICHIEDE SPICETIFY");
                         ui.spacing();
 
                         if ui.button("Esci") {
