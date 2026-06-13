@@ -95,7 +95,7 @@ async fn handle_connection(
     let send_task = tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok((sender_id, payload)) => {
+                Ok((sender_id, msg)) => {
                     if sender_id == client_id_clone {
                         continue; // don't echo back to sender
                     }
