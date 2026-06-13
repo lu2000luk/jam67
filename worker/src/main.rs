@@ -7,8 +7,8 @@ use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 /// Each room has a broadcast channel.
-/// Messages are (sender_id, payload) so receivers can skip their own messages.
-type Rooms = Arc<Mutex<HashMap<String, broadcast::Sender<(String, String)>>>>;
+/// Messages are (sender_id, message) so receivers can skip their own messages.
+type Rooms = Arc<Mutex<HashMap<String, broadcast::Sender<(String, Message)>>>>;
 
 const CHANNEL_CAPACITY: usize = 256;
 
@@ -99,7 +99,7 @@ async fn handle_connection(
                     if sender_id == client_id_clone {
                         continue; // don't echo back to sender
                     }
-                    if ws_write.send(Message::Text(payload.into())).await.is_err() {
+                    if ws_write.send(msg).await.is_err() {
                         break;
                     }
                 }
@@ -118,7 +118,10 @@ async fn handle_connection(
         while let Some(Ok(msg)) = ws_read.next().await {
             match msg {
                 Message::Text(text) => {
-                    let _ = tx_clone.send((client_id_clone.clone(), text.to_string()));
+                    let _ = tx_clone.send((client_id_clone.clone(), Message::Text(text)));
+                }
+                Message::Binary(data) => {
+                    let _ = tx_clone.send((client_id_clone.clone(), Message::Binary(data)));
                 }
                 Message::Close(_) => break,
                 _ => {}
